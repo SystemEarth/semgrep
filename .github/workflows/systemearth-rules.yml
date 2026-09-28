@@ -1,0 +1,112 @@
+# Snapshots the Semgrep Registry ruleset SystemEarth's SAST workflow runs into
+# the private GHCR package. Lives only on SystemEarth release branches of this
+# fork, never on upstream-tracking develop.
+#
+# The Semgrep Rules License permits internal use but not redistribution. This
+# repository is public, so the rules exist only in the job's temporary
+# directory and the private image: never commit them, cache them, upload them
+# as an artifact, or print them to the log.
+name: "SystemEarth: publish Semgrep rules"
+
+on:
+  push:
+    tags: ["rules-security-audit-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: systemearth-rules-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rules:
+    if: github.repository == 'SystemEarth/semgrep' && startsWith(github.ref, 'refs/tags/rules-security-audit-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ghcr.io/systemearth/semgrep
+      RULES_URL: https://semgrep.dev/c/p/security-audit
+    steps:
+      - id: fetch
+        name: Download the Semgrep Registry ruleset
+        run: |
+          context="$RUNNER_TEMP/rules"
+          mkdir -p "$context"
+          curl --fail --silent --show-error --retry 3 \
+            --output "$context/security-audit.yml" "$RULES_URL"
+          printf 'FROM scratch\nCOPY security-audit.yml /\nCMD ["none"]\n' \
+            >"$context/Dockerfile"
+          echo "context=$context" >>"$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$context/security-audit.yml" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
+
+      # Pro rules are not licensed for this use. Every registry rule carries
+      # its origin and license in metadata, so each count must equal the rule
+      # count.
+      - id: check
+        name: Require Community rules under the Semgrep Rules License
+        env:
+          RULES: ${{ steps.fetch.outputs.context }}/security-audit.yml
+        run: |
+          rules="$(grep -c '^- id: ' "$RULES")"
+          community="$(grep -c '^ *origin: community$' "$RULES")"
+          licensed="$(grep -c '^ *license: Semgrep Rules License v1.0\.' "$RULES")"
+          echo "Rules: $rules; community: $community; licensed: $licensed"
+          if [ "$rules" -eq 0 ] || [ "$community" -ne "$rules" ] || [ "$licensed" -ne "$rules" ]; then
+            echo "::error::Ruleset must contain only Community rules under the Semgrep Rules License"
+            exit 1
+          fi
+          echo "count=$rules" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No build cache: this repository's caches are readable by its other
+      # workflow runs.
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ steps.fetch.outputs.context }}
+          platforms: linux/amd64
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=LicenseRef-Semgrep-Rules-License-1.0
+            org.opencontainers.image.description=Semgrep Registry p/security-audit snapshot for internal SystemEarth use; not for redistribution
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          provenance: mode=max
+          sbom: false
+          push: true
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the pushed ruleset
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          EXPECTED_SHA256: ${{ steps.fetch.outputs.sha256 }}
+          RULE_COUNT: ${{ steps.check.outputs.count }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          container_id="$(docker create "$REF" none)"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          actual="$(docker cp "$container_id:/security-audit.yml" - | tar -xO security-audit.yml | sha256sum | cut -d' ' -f1)"
+          test "$actual" = "$EXPECTED_SHA256"
+          {
+            echo "### ${IMAGE}:${GITHUB_REF_NAME}@${DIGEST}"
+            echo
+            echo "${RULE_COUNT} Community rules; security-audit.yml sha256 ${actual}"
+          } >>"$GITHUB_STEP_SUMMARY"
